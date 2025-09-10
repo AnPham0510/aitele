@@ -28,7 +28,6 @@ class SchedulerServer:
         # Display startup message
         self.scheduler_view.display_startup_message()
         
-        # Đăng ký signal handlers để graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
@@ -68,7 +67,6 @@ class SchedulerServer:
                 await asyncio.sleep(5)  # Chờ 5s trước khi retry
                 
     def _signal_handler(self, signum, frame):
-        """Xử lý signal để shutdown gracefully"""
         logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
         

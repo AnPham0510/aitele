@@ -1,5 +1,9 @@
 import os
 from dataclasses import dataclass
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 @dataclass
 class Config:
@@ -19,7 +23,7 @@ class Config:
             port = os.getenv("POSTGRES_PORT", "5432")
             return f"postgresql://{user}:{password}@{host}:{port}/{db}"
         # Mặc định local
-        return "postgresql://user:pass@localhost:5432/callbot"
+        return ""
 
     DATABASE_URL: str = _build_db_url()
     
@@ -34,4 +38,4 @@ class Config:
     # Retry config
     DEFAULT_RETRY_INTERVAL: int = int(os.getenv("DEFAULT_RETRY_INTERVAL", "300"))  # 5 minutes
     MAX_RETRY_ATTEMPTS: int = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
-    
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")

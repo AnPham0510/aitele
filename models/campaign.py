@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 @dataclass
@@ -22,28 +22,26 @@ class Campaign:
     max_callback: Optional[int] = None
     callback_conditions: Optional[str] = None
     
-    def is_active(self) -> bool:
-        """Kiểm tra campaign có đang active không"""
-        return (self.status or "").lower() in {"running"}
-    
     def is_in_working_hours(self, current_hour: int) -> bool:
         """Kiểm tra có trong giờ làm việc không.
         """
         return True
     
     def is_time_valid(self) -> bool:
-        """Kiểm tra thời gian campaign có hợp lệ không (chuẩn hóa UTC để tránh naive/aware)."""
-        def to_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+        """Kiểm tra thời gian campaign có hợp lệ không (xử lý timezone UTC+7)."""
+        def to_utc7_aware(dt: Optional[datetime]) -> Optional[datetime]:
             if dt is None:
                 return None
             if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
+                # Assume naive datetime is already in UTC+7
+                return dt.replace(tzinfo=timezone(timedelta(hours=7)))
+            return dt.astimezone(timezone(timedelta(hours=7)))
 
-        now_utc = datetime.now(timezone.utc)
-        start_utc = to_aware_utc(self.start_time)
-        end_utc = to_aware_utc(self.end_time)
+        # Current time in UTC+7
+        now_utc7 = datetime.now(timezone(timedelta(hours=7)))
+        start_utc7 = to_utc7_aware(self.start_time)
+        end_utc7 = to_utc7_aware(self.end_time)
 
-        start_ok = (start_utc is None) or (start_utc <= now_utc)
-        end_ok = (end_utc is None) or (end_utc > now_utc)
+        start_ok = (start_utc7 is None) or (start_utc7 <= now_utc7)
+        end_ok = (end_utc7 is None) or (end_utc7 > now_utc7)
         return start_ok and end_ok

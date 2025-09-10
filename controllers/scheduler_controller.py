@@ -6,7 +6,7 @@ from models.config import Config
 from services.database_service import DatabaseService
 from services.campaign_service import CampaignService
 from controllers.campaign_controller import CampaignController
-
+from services.redis_service import RedisService
 logger = logging.getLogger(__name__)
 
 class SchedulerController:
@@ -58,15 +58,29 @@ class SchedulerController:
             
     async def _process_active_campaigns(self):
         """Xử lý các campaigns đang active"""
-        # Lấy danh sách campaigns từ database
-        campaigns = await self.db_service.get_active_campaigns_in_working_hours()
-        logger.info(f"[DEBUG] fetched_active_campaigns={len(campaigns)}")
+        # Lấy danh sách campaigns đang ở trạng thái running từ database
+        campaigns = await self.db_service.get_running_campaigns()
+        logger.info(f"[DEBUG] Số các chiến dịch đang running là: {len(campaigns)}")
         
-        # Filter campaigns active (no global working hours)
+        # Lấy danh sách campaings thỏa mãn thời gian thực hiện cuộc gọi
         active_campaigns = self.campaign_service.filter_active_campaigns(campaigns)
         logger.info(f"[DEBUG] filtered_active_campaigns={len(active_campaigns)}")
         
-        for campaign in active_campaigns:
+        # Cleanup dead controllers first
+        await self._cleanup_dead_controllers()
+        
+        # Check thread limit
+        current_thread_count = len(self.active_controllers)
+        max_threads = self.config.MAX_CONCURRENT_CAMPAIGNS
+        
+        if current_thread_count >= max_threads:
+            logger.warning(f"Thread limit reached: {current_thread_count}/{max_threads}. Skipping new campaigns.")
+            return
+        
+        available_slots = max_threads - current_thread_count
+        logger.info(f"Available thread slots: {available_slots}/{max_threads}")
+        
+        for campaign in active_campaigns[:available_slots]:  # Limit by available slots
             # Kiểm tra xem campaign đã có controller chưa
             if campaign.id not in self.active_controllers:
                 # Kiểm tra có leads cần gọi không
@@ -98,8 +112,7 @@ class SchedulerController:
     async def _process_stopped_campaigns(self):
         """Xử lý các campaigns cần dừng hoặc tạm dừng"""
         # Lấy campaigns đã ended hoặc paused
-        campaigns = await self.db_service.get_stopped_campaigns()
-        stopped_campaigns = self.campaign_service.filter_stopped_campaigns(campaigns)
+        stopped_campaigns = await self.db_service.get_stopped_campaigns()
         
         for campaign in stopped_campaigns:
             if campaign.id in self.active_controllers:
@@ -113,10 +126,27 @@ class SchedulerController:
                         fut = asyncio.run_coroutine_threadsafe(controller.stop(), loop)
                         fut.result(timeout=5)
                     except Exception as e:
-                        logger.warning(f"Failed to stop controller gracefully for {campaign.id}: {e}")
+                        logger.warning(f"Failed to stop controller for {campaign.id}: {e}")
 
                 # Do not remove here; wait for cleanup when finished
                 
+    async def _cleanup_dead_controllers(self):
+        """Dọn dẹp các controllers đã chết hoặc hoàn thành"""
+        dead_controllers = []
+        
+        for campaign_id, thread in self.controller_threads.items():
+            if not thread.is_alive():
+                dead_controllers.append(campaign_id)
+                logger.warning(f"Dead thread detected for campaign {campaign_id}")
+        
+        for campaign_id in dead_controllers:
+            logger.info(f"Cleaning up dead controller for campaign {campaign_id}")
+            # Clean maps
+            self.active_controllers.pop(campaign_id, None)
+            self.controller_loops.pop(campaign_id, None)
+            self.controller_db_services.pop(campaign_id, None)
+            self.controller_threads.pop(campaign_id, None)
+    
     async def _cleanup_finished_controllers(self):
         """Dọn dẹp các controllers đã hoàn thành"""
         finished_controllers = []
@@ -124,7 +154,7 @@ class SchedulerController:
         for campaign_id, controller in self.active_controllers.items():
             if controller.is_finished():
                 finished_controllers.append(campaign_id)
-                
+        
         for campaign_id in finished_controllers:
             logger.info(f"Cleaning up finished controller for campaign {campaign_id}")
             # Clean maps
@@ -158,7 +188,26 @@ class SchedulerController:
             db = self.controller_db_services.get(campaign_id)
             if db is None:
                 return
+            # KẾT NỐI DB
             loop.run_until_complete(db.connect())
+
+            # KẾT NỐI REDIS (trong thread này) VÀ GẮN VÀO CONTROLLER
+            
+            redis_svc = self.controller_redis_services.get(campaign_id) if hasattr(self, "controller_redis_services") else None
+            if redis_svc is None:
+                # tạo dict lưu redis services nếu chưa có
+                if not hasattr(self, "controller_redis_services"):
+                    self.controller_redis_services = {}
+                redis_svc = RedisService(self.config.REDIS_URL)
+                self.controller_redis_services[campaign_id] = redis_svc
+            loop.run_until_complete(redis_svc.connect())
+            if not hasattr(controller, "attach_redis"):
+                # fallback: gán trực tiếp thuộc tính nếu bạn chưa thêm attach_redis
+                controller.redis = redis_svc
+            else:
+                controller.attach_redis(redis_svc)
+
+            # CHẠY CONTROLLER
             loop.run_until_complete(controller.start())
         except Exception as e:
             logger.error(f"Controller thread crashed for campaign {campaign_id}: {e}")
@@ -167,6 +216,15 @@ class SchedulerController:
                 db = self.controller_db_services.get(campaign_id)
                 if db is not None:
                     loop.run_until_complete(db.disconnect())
+                try:
+                    redis_svc = self.controller_redis_services.get(campaign_id) if hasattr(self, "controller_redis_services") else None
+                    if redis_svc is not None:
+                        loop.run_until_complete(redis_svc.close())
+                        # optional: del khỏi dict
+                        try: del self.controller_redis_services[campaign_id]
+                        except Exception: pass
+                except Exception:
+                    pass
             except Exception:
                 pass
             finally:

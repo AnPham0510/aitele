@@ -26,15 +26,13 @@ class DatabaseService:
             await self.pool.close()
             logger.info("Disconnected from database")
             
-    async def get_active_campaigns_in_working_hours(self) -> List[Campaign]:
-        """Lấy danh sách campaigns active trong working hours"""
+    async def get_running_campaigns(self) -> List[Campaign]:
+        """Lấy danh sách campaigns có status running"""
         query = """
         SELECT c.id, c.tenant_id, c.name, c.status, c.start_time, c.end_time, c.script_id, c.call_interval,
                c.description, c.voice_id, c.email, c.max_call_time, c.time_of_day, c.max_callback, c.callback_conditions
         FROM public.campaigns c
-        WHERE c.status= 'running'
-          AND (c.start_time IS NULL OR c.start_time <= NOW())
-          AND (c.end_time IS NULL OR c.end_time > NOW())
+        WHERE c.status = 'running'
         """
         
         async with self.pool.acquire() as conn:
@@ -48,8 +46,7 @@ class DatabaseService:
         SELECT c.id, c.tenant_id, c.name, c.status, c.start_time, c.end_time, c.script_id, c.call_interval,
                c.description, c.voice_id, c.email, c.max_call_time, c.time_of_day, c.max_callback, c.callback_conditions
         FROM public.campaigns c
-        WHERE c.status = 'paused'
-          AND c.updated_at > NOW() - INTERVAL '2 minutes'
+        WHERE c.status IN ('paused', 'ended')
         """
         
         async with self.pool.acquire() as conn:
@@ -59,7 +56,6 @@ class DatabaseService:
     
     async def get_pending_leads_for_campaign(self, campaign_id: str) -> List[Lead]:
         """Lấy danh sách leads chưa được gọi cho campaign"""
-        #campaign_id = $1 là sao nhỉ?
         query = """
         SELECT c.id, c.phone_number, c.name, c.tenant_id, c.campaign_id
         FROM public.customers c
@@ -71,7 +67,20 @@ class DatabaseService:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query, campaign_id)
             
-        return [Lead(**dict(row)) for row in rows]
+        # Chuẩn hóa kiểu dữ liệu để tránh lệch kiểu (UUID vs str) gây lỗi rate-limit
+        leads: List[Lead] = []
+        for row in rows:
+            data = dict(row)
+            leads.append(
+                Lead(
+                    id=str(data.get("id")),
+                    phone_number=str(data.get("phone_number")),
+                    name=data.get("name"),
+                    tenant_id=str(data.get("tenant_id")) if data.get("tenant_id") is not None else None,
+                    campaign_id=str(data.get("campaign_id")) if data.get("campaign_id") is not None else None,
+                )
+            )
+        return leads
     
     async def get_retry_calls_for_campaign(self, campaign_id: str, retry_interval: int) -> List[CallSession]:
         logger.info("Retry calls disabled (call_sessions not in use)")

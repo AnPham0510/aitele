@@ -1,6 +1,6 @@
 import logging
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 from models.campaign import Campaign
 from models.lead import Lead
@@ -20,8 +20,6 @@ class CampaignService:
         active_campaigns = []
         
         for campaign in campaigns:
-            if not campaign.is_active():
-                continue
             # Safe time validity check (normalize timezone)
             if not self._is_time_valid_safe(campaign.start_time, campaign.end_time):
                 continue
@@ -34,30 +32,21 @@ class CampaignService:
 
     @staticmethod
     def _is_time_valid_safe(start_time: datetime | None, end_time: datetime | None) -> bool:
-        def to_aware_utc(dt: datetime | None) -> datetime | None:
+        """Kiểm tra thời gian campaign có hợp lệ không (xử lý timezone UTC+7)."""
+        def to_utc7_aware(dt: datetime | None) -> datetime | None:
             if dt is None:
                 return None
             if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
+                return dt.replace(tzinfo=timezone(timedelta(hours=7)))
+            return dt.astimezone(timezone(timedelta(hours=7)))
 
-        now_utc = datetime.now(timezone.utc)
-        start_utc = to_aware_utc(start_time)
-        end_utc = to_aware_utc(end_time)
-        start_ok = (start_utc is None) or (start_utc <= now_utc)
-        end_ok = (end_utc is None) or (end_utc > now_utc)
+        # Current time in UTC+7
+        now_utc7 = datetime.now(timezone(timedelta(hours=7)))
+        start_utc7 = to_utc7_aware(start_time)
+        end_utc7 = to_utc7_aware(end_time)
+        start_ok = (start_utc7 is None) or (start_utc7 <= now_utc7)
+        end_ok = (end_utc7 is None) or (end_utc7 > now_utc7)
         return start_ok and end_ok
-    
-    def filter_stopped_campaigns(self, campaigns: List[Campaign]) -> List[Campaign]:
-        """Lọc campaigns đã dừng hoặc tạm dừng"""
-        stopped_campaigns = []
-        
-        for campaign in campaigns:
-            if campaign.status == 'paused':
-                stopped_campaigns.append(campaign)
-                
-        return stopped_campaigns
-
     
     def should_retry_call(self, call_session: CallSession, campaign: Campaign) -> bool:
         """Kiểm tra có nên retry cuộc gọi theo cấu hình campaign.
@@ -112,7 +101,13 @@ class CampaignService:
         if not windows:
             return True
 
-        now_minutes = now.hour * 60 + now.minute
+        # Convert to UTC+7 timezone for comparison
+        if now.tzinfo is None:
+            now_utc7 = now.replace(tzinfo=timezone(timedelta(hours=7)))
+        else:
+            now_utc7 = now.astimezone(timezone(timedelta(hours=7)))
+        
+        now_minutes = now_utc7.hour * 60 + now_utc7.minute
 
         for w in windows:
             start = w.get("fromHour", 0) * 60 + w.get("fromMinute", 0)
@@ -126,11 +121,6 @@ class CampaignService:
                 # Normal window: [start, end)
                 if start <= now_minutes < end:
                     return True
-            # else:
-            #     # Overnight window: [start, 1440) or [0, end)
-            #     if now_minutes >= start or now_minutes < end:
-            #         return True
-
         return False
 
     def _parse_time_windows(self, time_of_day_field: Any) -> List[Dict[str, int]]:
