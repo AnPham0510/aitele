@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from models.campaign import Campaign
 from models.lead import Lead
-from models.call_session import CallSession
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +65,6 @@ class DatabaseService:
         
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query, campaign_id)
-            
-        # Chuẩn hóa kiểu dữ liệu để tránh lệch kiểu (UUID vs str) gây lỗi rate-limit
         leads: List[Lead] = []
         for row in rows:
             data = dict(row)
@@ -82,12 +79,16 @@ class DatabaseService:
             )
         return leads
     
-    async def get_retry_calls_for_campaign(self, campaign_id: str, retry_interval: int) -> List[CallSession]:
-        logger.info("Retry calls disabled (call_sessions not in use)")
-        return []
-    
-    async def create_call_session(self, call_id: str, campaign: Campaign, lead: Lead, retry_count: int):
-        logger.info(f"[NO-CS] create_call_session: call_id={call_id} lead={lead.phone_number} campaign={campaign.name}")
-            
-    async def update_call_retry_count(self, call_session_id: str, retry_count: int):
-        logger.info(f"[NO-CS] update_call_retry_count: id={call_session_id} retry={retry_count}")
+    async def get_campaign_by_id(self, campaign_id: str) -> Optional[Campaign]:
+        """Lấy thông tin campaign theo id"""
+        query = """
+        SELECT c.id, c.tenant_id, c.name, c.status, c.start_time, c.end_time, c.script_id, c.call_interval,
+               c.description, c.voice_id, c.email, c.max_call_time, c.time_of_day, c.max_callback, c.callback_conditions
+        FROM public.campaigns c
+        WHERE c.id = $1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, campaign_id)
+        if row is None:
+            return None
+        return Campaign(**dict(row))

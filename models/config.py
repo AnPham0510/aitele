@@ -7,7 +7,6 @@ load_dotenv()
 
 @dataclass
 class Config:
-    """Configuration model - quản lý cấu hình hệ thống"""
     # Database config
     def _build_db_url() -> str:
         # Ưu tiên DATABASE_URL nếu có
@@ -31,11 +30,7 @@ class Config:
     CHECK_INTERVAL: int = int(os.getenv("CHECK_INTERVAL", "60"))  # seconds
     MAX_CONCURRENT_CAMPAIGNS: int = int(os.getenv("MAX_CONCURRENT_CAMPAIGNS", "10"))
     
-    # Call scheduling config
-    WORKING_HOURS_START: int = int(os.getenv("WORKING_HOURS_START", "7"))  # 7AM
-    WORKING_HOURS_END: int = int(os.getenv("WORKING_HOURS_END", "21"))     # 9PM
-    
     # Retry config
     DEFAULT_RETRY_INTERVAL: int = int(os.getenv("DEFAULT_RETRY_INTERVAL", "300"))  # 5 minutes
     MAX_RETRY_ATTEMPTS: int = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_URL: str = os.getenv("REDIS_URL", "")

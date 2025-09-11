@@ -64,7 +64,7 @@ class SchedulerServer:
                 
             except Exception as e:
                 self.scheduler_view.display_error(str(e), "Main loop")
-                await asyncio.sleep(5)  # Chờ 5s trước khi retry
+                await asyncio.sleep(5)
                 
     def _signal_handler(self, signum, frame):
         logger.info(f"Received signal {signum}, shutting down...")

@@ -4,7 +4,6 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 from models.campaign import Campaign
 from models.lead import Lead
-from models.call_session import CallSession
 from models.config import Config
 
 logger = logging.getLogger(__name__)
@@ -20,11 +19,13 @@ class CampaignService:
         active_campaigns = []
         
         for campaign in campaigns:
-            # Safe time validity check (normalize timezone)
+            #Check start time, end time
             if not self._is_time_valid_safe(campaign.start_time, campaign.end_time):
+                logger.info(f"[TIME] Skip campaign {getattr(campaign, 'name', campaign.id)}: outside start/end window")
                 continue
-            # Time windows theo campaign.time_of_day (nếu có)
+            #Check time of day
             if not self.is_within_time_of_day(campaign, datetime.now()):
+                logger.info(f"[TIME] Skip campaign {getattr(campaign, 'name', campaign.id)}: outside time-of-day window")
                 continue
             active_campaigns.append(campaign)
         
@@ -48,34 +49,16 @@ class CampaignService:
         end_ok = (end_utc7 is None) or (end_utc7 > now_utc7)
         return start_ok and end_ok
     
-    def should_retry_call(self, call_session: CallSession, campaign: Campaign) -> bool:
-        """Kiểm tra có nên retry cuộc gọi theo cấu hình campaign.
-        - Số lần tối đa: campaign.max_callback (fallback: config.MAX_RETRY_ATTEMPTS)
-        - Khoảng cách tối thiểu: campaign.max_call_time (giây) (fallback: config.DEFAULT_RETRY_INTERVAL)
-        """
-        max_attempts = campaign.max_callback if isinstance(campaign.max_callback, int) and campaign.max_callback >= 0 else self.config.MAX_RETRY_ATTEMPTS
-        min_interval = campaign.max_call_time if isinstance(campaign.max_call_time, int) and campaign.max_call_time is not None else self.config.DEFAULT_RETRY_INTERVAL
-
-        if not call_session.can_retry(max_attempts):
-            return False
-
-        if call_session.end_time:
-            time_since_last_call = datetime.now() - call_session.end_time
-            if time_since_last_call.total_seconds() < (min_interval or 0):
-                return False
-
-        return True
-    
     def create_call_message(self, call_id: str, campaign: Campaign, lead: Lead, 
                           is_retry: bool = False, original_call_id: str = None) -> Dict[str, Any]:
         """Tạo message cho cuộc gọi"""
         message = {
             "callId": call_id,
-            "tenantId": campaign.tenant_id,
-            "campaignId": campaign.id,
+            "tenantId": str(campaign.tenant_id) if campaign.tenant_id else None,
+            "campaignId": str(campaign.id) if campaign.id else None,
             "campaignCode": campaign.name,
-            "scriptId": campaign.script_id,
-            "leadId": lead.id,
+            "scriptId": str(campaign.script_id) if campaign.script_id else None,
+            "leadId": str(lead.id) if lead.id else None,
             "leadPhoneNumber": lead.phone_number,
             "leadName": lead.get_display_name(),
             "timestamp": datetime.now().isoformat()
@@ -89,13 +72,11 @@ class CampaignService:
             
         return message
 
-    # --- Time of day helpers ---
     def is_within_time_of_day(self, campaign: Campaign, now: datetime) -> bool:
         """Kiểm tra thời điểm now có nằm trong các khung giờ campaign cho phép không.
 
         time_of_day format: [{"fromHour":8,"fromMinute":8,"toHour":8,"toMinute":8}]
         - Nếu không có cấu hình hoặc cấu hình rỗng/không hợp lệ: cho phép (trả True)
-        - Hỗ trợ khung giờ qua đêm (from > to)
         """
         windows = self._parse_time_windows(campaign.time_of_day)
         if not windows:

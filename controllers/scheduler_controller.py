@@ -16,6 +16,7 @@ class SchedulerController:
         self.config = config
         self.db_service = DatabaseService(config.DATABASE_URL)
         self.campaign_service = CampaignService(config)
+        self.redis_service = RedisService(config.REDIS_URL)
         
         # Track active campaign controllers
         self.active_controllers: Dict[str, CampaignController] = {}
@@ -24,19 +25,43 @@ class SchedulerController:
         self.controller_threads: Dict[str, threading.Thread] = {}
         self.controller_loops: Dict[str, asyncio.AbstractEventLoop] = {}
         self.controller_db_services: Dict[str, DatabaseService] = {}
+        self.controller_redis_services: Dict[str, RedisService] = {}
+        # Background callback listener task
+        self._callback_task: asyncio.Task | None = None
         
     async def initialize(self):
         """Khởi tạo các services"""
         await self.db_service.connect()
+        await self.redis_service.connect()
         logger.info("Scheduler controller initialized")
+        # Start background callback listener (independent from campaign threads)
+        try:
+            if self._callback_task is None or self._callback_task.done():
+                self._callback_task = asyncio.create_task(self._callback_listener())
+                logger.info("Callback listener started")
+        except Exception as e:
+            logger.warning(f"Failed to start callback listener: {e}")
         
     async def cleanup(self):
         """Dọn dẹp resources"""
+        # Stop background callback listener first
+        if self._callback_task is not None:
+            try:
+                self._callback_task.cancel()
+                try:
+                    await self._callback_task
+                except asyncio.CancelledError:
+                    pass
+            except Exception as e:
+                logger.warning(f"Error stopping callback listener: {e}")
+            finally:
+                self._callback_task = None
         # Stop all campaign controllers
         for controller in self.active_controllers.values():
             await controller.stop()
             
         await self.db_service.disconnect()
+        await self.redis_service.close()
         logger.info("Scheduler controller cleaned up")
         
     async def run_cycle(self):
@@ -44,7 +69,7 @@ class SchedulerController:
         logger.debug("Starting scheduler cycle...")
         
         try:
-            # 1. Kiểm tra campaigns active cần xử lý
+            # 1. Khởi tạo/duy trì controllers cho các campaigns đang active trước
             await self._process_active_campaigns()
             
             # 2. Kiểm tra campaigns cần dừng/tạm dừng
@@ -55,6 +80,140 @@ class SchedulerController:
             
         except Exception as e:
             logger.error(f"Error in scheduler cycle: {e}")
+
+    async def _callback_listener(self):
+        """Background loop to consume callbacks independently of campaign threads."""
+        logger.debug("Callback listener loop started")
+        try:
+            while True:
+                try:
+                    callbacks = await self.redis_service.get_call_callbacks(timeout=1)
+                    for callback in callbacks:
+                        await self._handle_call_callback(callback)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in callback listener: {e}")
+                    await asyncio.sleep(1)
+        finally:
+            logger.debug("Callback listener loop stopped")
+    
+    async def _process_call_callbacks(self):
+        """Xử lý callbacks từ Call Agent"""
+        try:
+            # Lấy callbacks từ Redis queue
+            callbacks = await self.redis_service.get_call_callbacks()
+            
+            if callbacks:
+                logger.info(f"Processing {len(callbacks)} callbacks from Call Agent")
+                
+            for callback in callbacks:
+                await self._handle_call_callback(callback)
+                
+        except Exception as e:
+            logger.error(f"Error processing call callbacks: {e}", exc_info=True)
+    
+    async def _handle_call_callback(self, callback_data: dict):
+        """Xử lý một callback từ Call Agent"""
+        try:
+            call_id = callback_data.get("callId")
+            status = callback_data.get("status")
+            campaign_id = str(callback_data.get("campaignId", ""))
+            lead_id = str(callback_data.get("leadId", ""))
+            
+            logger.info(f"Received callback for call {call_id}: {status}")
+            
+            # Tìm campaign controller tương ứng
+            controller = self.active_controllers.get(campaign_id)
+            if not controller:
+                logger.warning(f"No active controller found for campaign {campaign_id}")
+                try:
+                    if status == "SUCCESS":
+                        if self.redis_service:
+                            await self.redis_service.mark_lead_success(campaign_id, lead_id)
+                            await self.redis_service.mark_phone_success(campaign_id, callback_data.get("leadPhoneNumber", ""))
+
+                            try:
+                                await self.redis_service.save_success_and_finalize(call_id)
+                                await self.redis_service.remove_retry(campaign_id, call_id)
+                            except Exception:
+                                pass
+                    else:
+                        attempt = int(callback_data.get("attempt", 0))
+                        max_attempts = int(callback_data.get("maxAttempts", 3))
+                        if attempt + 1 < max_attempts and self.redis_service:
+                            retry_interval = int(callback_data.get("retryInterval", 300))
+                            payload = {
+                                "campaign_id": campaign_id,
+                                "lead_id": lead_id,
+                                "phone": callback_data.get("leadPhoneNumber", ""),
+                                "attempt": attempt + 1,
+                                "max_attempts": max_attempts,
+                                "retry_interval_s": retry_interval,
+                                "call_id": call_id,
+                                "last_outcome": status,
+                            }
+                            await self.redis_service.save_failure_and_schedule_retry(
+                                campaign_id, call_id, payload, delay_seconds=retry_interval
+                            )
+                    # Clear in-progress nếu có
+                    if self.redis_service:
+                        await self.redis_service.clear_inprogress(campaign_id, lead_id)
+                        try:
+                            await self.redis_service.clear_phone_inprogress(campaign_id, callback_data.get("leadPhoneNumber", ""))
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"Fallback Redis update failed for call {call_id}: {e}")
+                finally:
+                    return
+            
+            if status == "SUCCESS":
+                if controller.redis:
+                    await controller.redis.mark_lead_success(campaign_id, lead_id)
+                    await controller.redis.mark_phone_success(campaign_id, callback_data.get("leadPhoneNumber", ""))
+                    try:
+                        await controller.redis.save_success_and_finalize(call_id)
+                        await controller.redis.remove_retry(campaign_id, call_id)
+                    except Exception:
+                        pass
+                logger.info(f"Lead {lead_id} marked as SUCCESS")
+                
+            else:
+                # Xử lý retry nếu cần
+                attempt = callback_data.get("attempt", 0)
+                max_attempts = callback_data.get("maxAttempts", 3)
+                
+                if attempt + 1 < max_attempts:
+                    # Lên lịch retry
+                    retry_interval = callback_data.get("retryInterval", 300)
+                    payload = {
+                        "campaign_id": campaign_id,
+                        "lead_id": lead_id,
+                        "phone": callback_data.get("leadPhoneNumber", ""),
+                        "attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                        "retry_interval_s": retry_interval,
+                        "call_id": call_id,
+                        "last_outcome": status,
+                    }
+                    
+                    if controller.redis:
+                        await controller.redis.save_failure_and_schedule_retry(
+                            campaign_id, call_id, payload, delay_seconds=retry_interval
+                        )
+                    logger.info(f"Scheduled retry for call {call_id} (attempt {attempt + 1})")
+                else:
+                    # Hết lượt retry
+                    logger.info(f"Call {call_id} exceeded max attempts, marking as failed")
+            
+            # Clear in-progress status
+            if controller.redis:
+                await controller.redis.clear_inprogress(campaign_id, lead_id)
+                await controller.redis.clear_phone_inprogress(campaign_id, callback_data.get("leadPhoneNumber", ""))
+                
+        except Exception as e:
+            logger.error(f"Error handling callback for call {callback_data.get('callId', 'unknown')}: {e}")
             
     async def _process_active_campaigns(self):
         """Xử lý các campaigns đang active"""
@@ -92,8 +251,11 @@ class SchedulerController:
 
                     # Create per-campaign db service (isolated pool per thread)
                     per_db = DatabaseService(self.config.DATABASE_URL)
+                    
+                    # Create per-campaign redis service (isolated connection per thread)
+                    per_redis = RedisService(self.config.REDIS_URL)
 
-                    # Create controller object (will be run in its own event loop in a thread)
+                    # Create controller object
                     controller = CampaignController(
                         campaign=campaign,
                         db_service=per_db,
@@ -103,6 +265,7 @@ class SchedulerController:
 
                     self.active_controllers[campaign.id] = controller
                     self.controller_db_services[campaign.id] = per_db
+                    self.controller_redis_services[campaign.id] = per_redis
 
                     # Start controller in a dedicated thread
                     t = threading.Thread(target=self._run_controller_thread, args=(campaign.id,), daemon=True)
@@ -146,6 +309,7 @@ class SchedulerController:
             self.controller_loops.pop(campaign_id, None)
             self.controller_db_services.pop(campaign_id, None)
             self.controller_threads.pop(campaign_id, None)
+            self.processed_campaigns.discard(campaign_id)
     
     async def _cleanup_finished_controllers(self):
         """Dọn dẹp các controllers đã hoàn thành"""
@@ -157,13 +321,35 @@ class SchedulerController:
         
         for campaign_id in finished_controllers:
             logger.info(f"Cleaning up finished controller for campaign {campaign_id}")
+            
+            # Stop controller nếu chưa dừng
+            controller = self.active_controllers.get(campaign_id)
+            if controller and not controller.is_stopped:
+                await controller.stop()
+            
             # Clean maps
             self.active_controllers.pop(campaign_id, None)
             self.controller_loops.pop(campaign_id, None)
-            # Ensure db service is disconnected (thread entry should have closed already)
-            self.controller_db_services.pop(campaign_id, None)
+            
+            # Disconnect db service
+            db_service = self.controller_db_services.pop(campaign_id, None)
+            if db_service:
+                try:
+                    await db_service.disconnect()
+                except Exception as e:
+                    logger.warning(f"Error disconnecting db service for campaign {campaign_id}: {e}")
+            
+            # Disconnect redis service
+            redis_service = self.controller_redis_services.pop(campaign_id, None)
+            if redis_service:
+                try:
+                    await redis_service.close()
+                except Exception as e:
+                    logger.warning(f"Error disconnecting redis service for campaign {campaign_id}: {e}")
+            
             # Thread is daemon; remove reference
             self.controller_threads.pop(campaign_id, None)
+            self.processed_campaigns.discard(campaign_id)
             
     def get_status(self) -> Dict[str, any]:
         """Lấy trạng thái của scheduler"""
@@ -192,20 +378,13 @@ class SchedulerController:
             loop.run_until_complete(db.connect())
 
             # KẾT NỐI REDIS (trong thread này) VÀ GẮN VÀO CONTROLLER
-            
-            redis_svc = self.controller_redis_services.get(campaign_id) if hasattr(self, "controller_redis_services") else None
+            redis_svc = self.controller_redis_services.get(campaign_id)
             if redis_svc is None:
-                # tạo dict lưu redis services nếu chưa có
-                if not hasattr(self, "controller_redis_services"):
-                    self.controller_redis_services = {}
-                redis_svc = RedisService(self.config.REDIS_URL)
-                self.controller_redis_services[campaign_id] = redis_svc
+                logger.error(f"No Redis service found for campaign {campaign_id}")
+                return
+                
             loop.run_until_complete(redis_svc.connect())
-            if not hasattr(controller, "attach_redis"):
-                # fallback: gán trực tiếp thuộc tính nếu bạn chưa thêm attach_redis
-                controller.redis = redis_svc
-            else:
-                controller.attach_redis(redis_svc)
+            controller.attach_redis(redis_svc)
 
             # CHẠY CONTROLLER
             loop.run_until_complete(controller.start())
@@ -216,17 +395,13 @@ class SchedulerController:
                 db = self.controller_db_services.get(campaign_id)
                 if db is not None:
                     loop.run_until_complete(db.disconnect())
-                try:
-                    redis_svc = self.controller_redis_services.get(campaign_id) if hasattr(self, "controller_redis_services") else None
-                    if redis_svc is not None:
-                        loop.run_until_complete(redis_svc.close())
-                        # optional: del khỏi dict
-                        try: del self.controller_redis_services[campaign_id]
-                        except Exception: pass
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                
+                redis_svc = self.controller_redis_services.get(campaign_id)
+                if redis_svc is not None:
+                    loop.run_until_complete(redis_svc.close())
+                    
+            except Exception as e:
+                logger.warning(f"Error cleaning up resources for campaign {campaign_id}: {e}")
             finally:
                 try:
                     loop.stop()
